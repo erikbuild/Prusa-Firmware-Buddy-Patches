@@ -1,0 +1,324 @@
+Boot-splash custom image and byline for Prusa-Firmware-Buddy
+============================================================
+
+Draws a compiled-in image over the bootloader's Prusa logo on the firmware
+boot splash and adds a byline beneath the version text. CoreOne family only
+(COREONE incl. INDX variants; 480x320 display); other printers compile the
+feature out entirely.
+
+This patch is code-only. After applying, the build requires an image at
+    src/gui/res/splash/splash_image.png
+and reads the byline text from
+    src/gui/splash_byline.hpp
+The apply script handles both (defaults: the kit's pony, "by @erikbuild"):
+    patches/boot-splash/apply.sh [--image your.png] [--text "by @you"] [--version "X.Y.Z+N"]
+Manual equivalent:
+    git apply patches/boot-splash/boot-splash.patch
+    mkdir -p src/gui/res/splash
+    cp patches/boot-splash/spedpony_256x152.png src/gui/res/splash/splash_image.png
+
+Image constraints: PNG, at most 480 wide and 157 tall (a static_assert
+enforces it must clear the progress bar), transparency flattened on black.
+The build converts it to QOI and embeds it in the firmware binary (no
+external flash dependency), regenerating whenever the PNG changes. Python
+deps (pillow, qoi, numpy) are stock requirements.txt entries.
+
+Version: --version writes "X.Y.Z+N" to version.txt; the patch makes the
+build honor the +N as BUILD_NUMBER (explicit -D BUILD_NUMBER= still wins,
+and a version.txt without +N keeps stock git-count behavior). Pick N above
+the installed firmware's build number so the bootloader auto-offers the
+.bbf.
+
+Validate (host unit tests, needs GCC -- see macos-host-unit-tests.patch on
+macOS):
+    python3 utils/build_tests.py memory_byte_reader_tests -t -- -R MemoryByteReader
+
+Prepared against release 6.6.2. If a future release rejects hunks, the new
+files (src/common/memory_byte_reader.hpp, src/gui/splash_byline.hpp,
+utils/qoi_to_cpp.py, tests/unit/common/memory_byte_reader_test.cpp) always
+apply; only the context edits (cmake/ProjectVersion.cmake,
+src/gui/CMakeLists.txt, screen_splash.cpp, screen_splash.hpp,
+tests/unit/common/CMakeLists.txt) may need manual replay.
+
+diff --git a/cmake/ProjectVersion.cmake b/cmake/ProjectVersion.cmake
+index e94fd233..c96e1352 100644
+--- a/cmake/ProjectVersion.cmake
++++ b/cmake/ProjectVersion.cmake
+@@ -24,6 +24,12 @@ set(PROJECT_VERSION_MAJOR ${CMAKE_MATCH_1})
+ set(PROJECT_VERSION_MINOR ${CMAKE_MATCH_2})
+ set(PROJECT_VERSION_PATCH ${CMAKE_MATCH_3})
+ 
++# Optional "+N" build number in version.txt overrides the git-count fallback
++string(REGEX MATCH "\\+([0-9]+)" build_number_match "${content}")
++if(build_number_match AND NOT BUILD_NUMBER)
++  set(BUILD_NUMBER ${CMAKE_MATCH_1})
++endif()
++
+ function(resolve_version_variables)
+   # BUILD_NUMBER
+   if(NOT BUILD_NUMBER)
+diff --git a/src/common/memory_byte_reader.hpp b/src/common/memory_byte_reader.hpp
+new file mode 100644
+index 00000000..9ce58454
+--- /dev/null
++++ b/src/common/memory_byte_reader.hpp
+@@ -0,0 +1,32 @@
++/// @file
++// ABOUTME: AbstractByteReader that reads sequentially from an in-memory buffer.
++// ABOUTME: Used to decode a compiled-in QOI image without the flash resource file.
++#pragma once
++
++#include "abstract_byte_reader.hpp"
++#include <algorithm>
++#include <cstring>
++
++class MemoryByteReader final : public AbstractByteReader {
++public:
++    MemoryByteReader(const uint8_t *data, size_t size)
++        : data_(data)
++        , size_(size)
++        , pos_(0) {}
++
++    // Overriding read(span<byte>) hides the base read(span<uint8_t>) convenience
++    // overload; re-expose it so callers (and the unit test) can use either.
++    using AbstractByteReader::read;
++
++    std::span<std::byte> read(std::span<std::byte> buffer) final {
++        const size_t n = std::min(buffer.size(), size_ - pos_);
++        std::memcpy(buffer.data(), data_ + pos_, n);
++        pos_ += n;
++        return { buffer.data(), n };
++    }
++
++private:
++    const uint8_t *data_;
++    size_t size_;
++    size_t pos_;
++};
+diff --git a/src/gui/CMakeLists.txt b/src/gui/CMakeLists.txt
+index 80075973..7d77f9f9 100644
+--- a/src/gui/CMakeLists.txt
++++ b/src/gui/CMakeLists.txt
+@@ -83,6 +83,21 @@ target_sources(
+           window_wizard_icon.cpp
+   )
+ 
++# Generated compile-time QOI array for the boot-splash image
++set(splash_image_png "${CMAKE_SOURCE_DIR}/src/gui/res/splash/splash_image.png")
++set(splash_image_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/gen")
++set(splash_image_gen_hpp "${splash_image_gen_dir}/splash_image_qoi.gen.hpp")
++add_custom_command(
++  OUTPUT "${splash_image_gen_hpp}"
++  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/utils/qoi_to_cpp.py" "${splash_image_png}"
++          "${splash_image_gen_hpp}" --namespace splash_image
++  DEPENDS "${splash_image_png}" "${CMAKE_SOURCE_DIR}/utils/qoi_to_cpp.py"
++  VERBATIM
++  )
++add_custom_target(splash_image_generated DEPENDS "${splash_image_gen_hpp}")
++add_dependencies(firmware splash_image_generated)
++target_include_directories(firmware PRIVATE "${splash_image_gen_dir}")
++
+ if(HAS_CRASH_DETECTION)
+   target_sources(firmware PRIVATE screen_crash_recovery.cpp)
+ endif()
+diff --git a/src/gui/screen_splash.cpp b/src/gui/screen_splash.cpp
+index 0b416bec..bf57de5f 100644
+--- a/src/gui/screen_splash.cpp
++++ b/src/gui/screen_splash.cpp
+@@ -50,6 +50,11 @@
+ #endif
+ 
+ #include "display.hpp"
++#if PRINTER_IS_PRUSA_COREONE()
++    #include <memory_byte_reader.hpp>
++    #include "splash_image_qoi.gen.hpp"
++    #include "splash_byline.hpp"
++#endif
+ #include <option/has_switched_fan_test.h>
+ 
+ #if HAS_MINI_DISPLAY()
+@@ -67,12 +72,24 @@
+     #define SPLASHSCREEN_VERSION_Y     185
+ #endif
+ 
++#if PRINTER_IS_PRUSA_COREONE()
++constexpr uint16_t splash_image_y = 8;
++static_assert(splash_image::qoi_size > 0, "boot-splash image is empty");
++static_assert(splash_image::width <= GuiDefaults::ScreenWidth
++        && splash_image_y + splash_image::height <= SPLASHSCREEN_PROGRESSBAR_Y,
++    "boot-splash image must fit above the progress bar");
++#endif
++
+ using buddy::BootstrapStage;
+ 
+ ScreenSplash::ScreenSplash()
+     : screen_t()
+     , text_progress(this, Rect16(0, SPLASHSCREEN_VERSION_Y, GuiDefaults::ScreenWidth, 18), is_multiline::no)
+-    , progress(this, Rect16(SPLASHSCREEN_PROGRESSBAR_X, SPLASHSCREEN_PROGRESSBAR_Y, SPLASHSCREEN_PROGRESSBAR_W, SPLASHSCREEN_PROGRESSBAR_H), COLOR_BRAND, COLOR_GRAY, 6) {
++    , progress(this, Rect16(SPLASHSCREEN_PROGRESSBAR_X, SPLASHSCREEN_PROGRESSBAR_Y, SPLASHSCREEN_PROGRESSBAR_W, SPLASHSCREEN_PROGRESSBAR_H), COLOR_BRAND, COLOR_GRAY, 6)
++#if PRINTER_IS_PRUSA_COREONE()
++    , text_author(this, Rect16(0, 207, GuiDefaults::ScreenWidth, 24), is_multiline::no)
++#endif
++{
+     ClrMenuTimeoutClose();
+ 
+     text_progress.set_font(Font::small);
+@@ -83,6 +100,13 @@ ScreenSplash::ScreenSplash()
+     text_progress.SetText(string_view_utf8::MakeRAM(text_progress_buffer));
+     progress.set_progress_percent(50);
+ 
++#if PRINTER_IS_PRUSA_COREONE()
++    text_author.set_font(Font::big);
++    text_author.SetAlignment(Align_t::Center());
++    text_author.SetTextColor(COLOR_GRAY);
++    text_author.SetText(string_view_utf8::MakeCPUFLASH(splash_byline));
++#endif
++
+ #if ENABLED(POWER_PANIC)
+     // don't present any screen or wizard if there is a powerpanic pending
+     if (power_panic::state_stored()) {
+@@ -410,7 +434,17 @@ void ScreenSplash::draw() {
+     Validate();
+     progress.Invalidate();
+     text_progress.Invalidate();
++#if PRINTER_IS_PRUSA_COREONE()
++    text_author.Invalidate();
++#endif
+     screen_t::draw(); // We want to draw over bootloader's screen without flickering/redrawing
++
++#if PRINTER_IS_PRUSA_COREONE()
++    // Blit the compiled-in image over the (bootloader-drawn) logo area.
++    MemoryByteReader image_reader(splash_image::qoi_data, splash_image::qoi_size);
++    display::draw_img(point_ui16_t { (GuiDefaults::ScreenWidth - splash_image::width) / 2, splash_image_y }, image_reader);
++#endif
++
+ #ifdef _DEBUG
+     #if HAS_MINI_DISPLAY()
+     display::draw_text(Rect16(180, 91, 60, 16), string_view_utf8::MakeCPUFLASH("DEBUG"), Font::small, COLOR_BLACK, COLOR_RED);
+diff --git a/src/gui/screen_splash.hpp b/src/gui/screen_splash.hpp
+index 2f4b8c7f..01a11455 100644
+--- a/src/gui/screen_splash.hpp
++++ b/src/gui/screen_splash.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ #include "gui.hpp"
+ #include "screen.hpp"
++#include "config.h"
+ #include <guiconfig/guiconfig.h>
+ #include <buddy/bootstrap_state.hpp>
+ #include <utils/progress_mapper.hpp>
+@@ -8,6 +9,9 @@
+ class ScreenSplash : public screen_t {
+     window_text_t text_progress;
+     WindowRoundedProgressBar progress;
++#if PRINTER_IS_PRUSA_COREONE()
++    window_text_t text_author;
++#endif
+ 
+     char text_progress_buffer[32];
+ 
+diff --git a/src/gui/splash_byline.hpp b/src/gui/splash_byline.hpp
+new file mode 100644
+index 00000000..d1fd9de6
+--- /dev/null
++++ b/src/gui/splash_byline.hpp
+@@ -0,0 +1,5 @@
++#pragma once
++// ABOUTME: Byline text drawn on the boot splash below the version line.
++// ABOUTME: Rewritten by patches/boot-splash/apply.sh --text "by @you".
++
++inline constexpr const char *splash_byline = "by @erikbuild";
+diff --git a/tests/unit/common/CMakeLists.txt b/tests/unit/common/CMakeLists.txt
+index 080d7068..f3e62617 100644
+--- a/tests/unit/common/CMakeLists.txt
++++ b/tests/unit/common/CMakeLists.txt
+@@ -108,6 +108,12 @@ target_include_directories(path_utils_tests PUBLIC ${CMAKE_SOURCE_DIR}/src/commo
+ add_executable(exponential_backoff_tests ${CMAKE_CURRENT_SOURCE_DIR}/exponential_backoff_tests.cpp)
+ target_include_directories(exponential_backoff_tests PUBLIC ${CMAKE_SOURCE_DIR}/src/common)
+ 
++add_executable(
++  memory_byte_reader_tests ${CMAKE_CURRENT_SOURCE_DIR}/memory_byte_reader_test.cpp
++  )
++target_include_directories(memory_byte_reader_tests PUBLIC ${CMAKE_SOURCE_DIR}/src/common)
++add_catch_test(memory_byte_reader_tests)
++
+ add_catch_test(support_utils_tests)
+ add_catch_test(str_utils_tests)
+ add_catch_test(timing_tests)
+diff --git a/tests/unit/common/memory_byte_reader_test.cpp b/tests/unit/common/memory_byte_reader_test.cpp
+new file mode 100644
+index 00000000..3633f93e
+--- /dev/null
++++ b/tests/unit/common/memory_byte_reader_test.cpp
+@@ -0,0 +1,28 @@
++#include <catch2/catch_test_macros.hpp>
++#include <cstdint>
++#include <memory_byte_reader.hpp>
++
++TEST_CASE("MemoryByteReader reads sequentially in chunks", "[memory_byte_reader]") {
++    const uint8_t src[] = { 10, 20, 30, 40, 50 };
++    MemoryByteReader reader(src, sizeof(src));
++
++    uint8_t buf[2] = {};
++    auto a = reader.read(std::span<uint8_t>(buf, 2));
++    REQUIRE(a.size() == 2);
++    REQUIRE(buf[0] == 10);
++    REQUIRE(buf[1] == 20);
++
++    auto b = reader.read(std::span<uint8_t>(buf, 2));
++    REQUIRE(b.size() == 2);
++    REQUIRE(buf[0] == 30);
++    REQUIRE(buf[1] == 40);
++
++    // Final partial read: only 1 byte left
++    auto c = reader.read(std::span<uint8_t>(buf, 2));
++    REQUIRE(c.size() == 1);
++    REQUIRE(buf[0] == 50);
++
++    // At end: empty span
++    auto d = reader.read(std::span<uint8_t>(buf, 2));
++    REQUIRE(d.size() == 0);
++}
+diff --git a/utils/qoi_to_cpp.py b/utils/qoi_to_cpp.py
+new file mode 100755
+index 00000000..f394b0c4
+--- /dev/null
++++ b/utils/qoi_to_cpp.py
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python3
++# ABOUTME: Encodes a single PNG to QOI and emits a C++ header with the bytes as
++# ABOUTME: an inline constexpr array plus its width/height, for compile-time use.
++from argparse import ArgumentParser
++from pathlib import Path
++from PIL import Image
++import numpy
++import qoi
++
++
++def main():
++    parser = ArgumentParser()
++    parser.add_argument("input", type=Path, help="Path to the source PNG")
++    parser.add_argument("output", type=Path, help="Path to the generated .hpp")
++    parser.add_argument("--namespace", default="splash_pony")
++    args = parser.parse_args()
++
++    with Image.open(args.input).convert("RGBA") as png:
++        width, height = png.width, png.height
++        data = qoi.encode(numpy.array(png))
++
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    with open(args.output, "w") as f:
++        f.write("#pragma once\n#include <cstddef>\n#include <cstdint>\n\n")
++        f.write(f"namespace {args.namespace} {{\n")
++        f.write(f"inline constexpr uint16_t width = {width};\n")
++        f.write(f"inline constexpr uint16_t height = {height};\n")
++        f.write("inline constexpr uint8_t qoi_data[] = {\n")
++        for i in range(0, len(data), 16):
++            f.write("    " + ",".join(str(b) for b in data[i:i + 16]) + ",\n")
++        f.write("};\n")
++        f.write("inline constexpr size_t qoi_size = sizeof(qoi_data);\n")
++        f.write(f"}} // namespace {args.namespace}\n")
++
++
++if __name__ == "__main__":
++    main()
