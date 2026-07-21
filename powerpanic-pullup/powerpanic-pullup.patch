@@ -1,0 +1,35 @@
+Power panic AC-fault pullup for Prusa-Firmware-Buddy
+====================================================
+
+Sets an internal pullup on the xBuddy acFault pin (PG0). An open power
+panic line floats and can read as an active (low) AC fault, redscreening
+at boot and firing spurious power panics. The internal pullup holds an
+open PG0 high; a connected PSU-side driver overrides the weak pullup, so
+behavior on healthy hardware is unchanged. The iX and MK3.5 acFault lines
+are deliberately untouched.
+
+Apply from the repo root (or use the script):
+    git apply patches/powerpanic-pullup/powerpanic-pullup.patch
+    patches/powerpanic-pullup/apply.sh
+
+No host-side test exists for a pin constant; verification is that the
+firmware builds and the printer no longer redscreens with an open power
+panic connector.
+
+Prepared against release 6.6.2. Single context hunk in
+src/common/hwio_pindef.h; if a future release rejects it, find the xBuddy
+acFault line and change Pull::none to Pull::up by hand.
+
+diff --git a/src/common/hwio_pindef.h b/src/common/hwio_pindef.h
+index 741a691b..80b6eba7 100644
+--- a/src/common/hwio_pindef.h
++++ b/src/common/hwio_pindef.h
+@@ -399,7 +399,7 @@ void hw_init_spi_side_leds();
+             MACRO_FUNCTION(buddy::hw::InputPin, fsUSBOvercurrent, buddy::hw::IoPort::F COMMA buddy::hw::IoPin::p14, IMode::input COMMA Pull::none, buddy::hw::noHandler) \
+             MACRO_FUNCTION(buddy::hw::InputPin, fsUSBCInt, buddy::hw::IoPort::A COMMA buddy::hw::IoPin::p9, IMode::input COMMA Pull::none, buddy::hw::noHandler) \
+             MACRO_FUNCTION(buddy::hw::OutputPin, acellCs, buddy::hw::IoPort::A COMMA buddy::hw::IoPin::p10, Pin::State::high COMMA OMode::pushPull COMMA OSpeed::high, buddy::hw::noHandler) \
+-            MACRO_FUNCTION(buddy::hw::InterruptPin, acFault, buddy::hw::IoPort::G COMMA buddy::hw::IoPin::p0, IMode::IT_falling COMMA Pull::none COMMA ISR_PRIORITY_POWER_PANIC COMMA 0, power_panic::ac_fault_isr) \
++            MACRO_FUNCTION(buddy::hw::InterruptPin, acFault, buddy::hw::IoPort::G COMMA buddy::hw::IoPin::p0, IMode::IT_falling COMMA Pull::up COMMA ISR_PRIORITY_POWER_PANIC COMMA 0, power_panic::ac_fault_isr) \
+             MACRO_FUNCTION(buddy::hw::OutputPin, extFlashCs, buddy::hw::IoPort::F COMMA buddy::hw::IoPin::p2, Pin::State::high COMMA OMode::pushPull COMMA OSpeed::high, buddy::hw::noHandler) \
+             MACRO_FUNCTION(buddy::hw::InputPin, fanTach, buddy::hw::IoPort::E COMMA buddy::hw::IoPin::p10, IMode::input COMMA Pull::up, buddy::hw::noHandler) \
+             MACRO_FUNCTION(buddy::hw::InputOutputPin, touch_sig, buddy::hw::IoPort::C COMMA buddy::hw::IoPin::p8, IMode::input COMMA Pull::none, buddy::hw::noHandler) \

@@ -1,0 +1,726 @@
+G751 squiggly purge line for Prusa-Firmware-Buddy
+==================================================
+
+Port of the Klipper community "squiggly purge" macro as custom G-code G751:
+a cosine-wave prime line with flow-derived line width/feedrate and adaptive
+placement near the print area (from the M555 print-area rect that stock
+PrusaSlicer start G-code already sends). Scoped to the non-INDX CoreOne
+family (COREONE incl. Core One+, COREONEL); INDX builds exclude it entirely.
+
+Usage from slicer start G-code (replaces the stock purge-line block):
+    G751 [L purge mm] [Q mm3/s] [A amplitude] [W wavelength] [P periods]
+         [S steps/period] [H line height] [U unretract] [D 0=X/1=Y]
+         [X/Y start override] [C adaptive 0/1] [M margin] [B max cross-section mm2]
+
+Apply from the repo root (or use the script):
+    git apply patches/g751-squiggly-purge/g751-squiggly-purge.patch
+    patches/g751-squiggly-purge/apply.sh
+Validate (host unit tests, needs GCC; build first, then run — the -t flag
+skips building):
+    python3 utils/build_tests.py squiggly_purge_tests
+    python3 utils/build_tests.py squiggly_purge_tests -t -- -R squiggly_purge
+
+Prepared against release 6.6.2. If a future release rejects hunks, the new
+files (src/feature/squiggly_purge/*, src/marlin_stubs/G751.cpp,
+tests/unit/feature/squiggly_purge/*) always apply; only the four small
+context edits (two CMakeLists source lists, PrusaGcodeSuite.hpp declaration,
+gcode.cpp dispatch case) may need manual replay. Check that upstream has not
+claimed G-code number 751.
+
+diff --git a/src/feature/CMakeLists.txt b/src/feature/CMakeLists.txt
+index 3df93f61..f37f4303 100644
+--- a/src/feature/CMakeLists.txt
++++ b/src/feature/CMakeLists.txt
+@@ -96,5 +96,6 @@ add_subdirectory(motor_current_profile)
+ add_subdirectory(ramming)
+ add_subdirectory(cork)
+ add_subdirectory(safety_timer)
++add_subdirectory(squiggly_purge)
+ add_subdirectory(stepper_timeout)
+ add_subdirectory(gcode_exception)
+diff --git a/src/feature/squiggly_purge/CMakeLists.txt b/src/feature/squiggly_purge/CMakeLists.txt
+new file mode 100644
+index 00000000..53b022ab
+--- /dev/null
++++ b/src/feature/squiggly_purge/CMakeLists.txt
+@@ -0,0 +1,3 @@
++if(PRINTER STREQUAL "COREONE" OR PRINTER STREQUAL "COREONEL")
++  target_sources(firmware PRIVATE squiggly_purge.cpp)
++endif()
+diff --git a/src/feature/squiggly_purge/squiggly_purge.cpp b/src/feature/squiggly_purge/squiggly_purge.cpp
+new file mode 100644
+index 00000000..4a9a7e63
+--- /dev/null
++++ b/src/feature/squiggly_purge/squiggly_purge.cpp
+@@ -0,0 +1,114 @@
++/// @file
++// ABOUTME: Pure geometry and extrusion math for the G751 squiggly purge line.
++// ABOUTME: Cosine path, flow-derived line width/feedrate, adaptive placement.
++#include "squiggly_purge.hpp"
++
++#include <algorithm>
++#include <cmath>
++#include <numbers>
++
++namespace squiggly_purge {
++
++namespace {
++    constexpr float filament_area = std::numbers::pi_v<float> * (filament_diameter / 2) * (filament_diameter / 2);
++    constexpr float cap_fill = 0.98f; ///< stay slightly under max_cross_section after capping
++    constexpr float min_width_to_height = 2.f; ///< thinner lines than this do not stick to the bed
++
++    bool params_valid(const Params &p) {
++        return p.periods >= 1 && p.steps_per_period >= 1
++            && p.purge_length > 0 && p.flowrate > 0
++            && p.amplitude >= 0 && p.wavelength > 0
++            && p.line_height > 0 && p.margin >= 0
++            && p.max_cross_section > 0;
++    }
++} // namespace
++
++int segment_count(const Params &p) {
++    return p.periods * p.steps_per_period;
++}
++
++PathPoint path_point(const Params &p, int i) {
++    const float phase = float(i) / float(p.steps_per_period) * 2 * std::numbers::pi_v<float>;
++    return {
++        .along = float(i) * p.wavelength / float(p.steps_per_period),
++        .across = p.amplitude * (0.5f - 0.5f * std::cos(phase)),
++    };
++}
++
++float path_length(const Params &p) {
++    float length = 0;
++    PathPoint prev = path_point(p, 0);
++    for (int i = 1; i <= segment_count(p); i++) {
++        const PathPoint pt = path_point(p, i);
++        length += std::hypot(pt.along - prev.along, pt.across - prev.across);
++        prev = pt;
++    }
++    return length;
++}
++
++std::expected<Geometry, Error> compute_geometry(const Params &p) {
++    if (!params_valid(p)) {
++        return std::unexpected(Error::degenerate_params);
++    }
++
++    const float length = path_length(p);
++    Geometry g {
++        .line_width = p.purge_length * filament_area / (p.line_height * length),
++        .feedrate = 0,
++        .purge_length = p.purge_length,
++        .capped = false,
++    };
++
++    if (p.line_height * g.line_width > p.max_cross_section) {
++        g.capped = true;
++        g.purge_length = cap_fill * p.max_cross_section * length / filament_area;
++        g.line_width = g.purge_length * filament_area / (p.line_height * length);
++    }
++
++    // the Klipper macro aborts at height/width >= 0.5, i.e. width <= 2 * height
++    if (g.line_width <= min_width_to_height * p.line_height) {
++        return std::unexpected(Error::line_too_thin);
++    }
++
++    g.feedrate = p.flowrate / (p.line_height * g.line_width);
++    return g;
++}
++
++std::expected<Start, Error> compute_placement(const Params &p, const Rect &bed,
++    const std::optional<Rect> &print_area,
++    std::optional<float> override_x, std::optional<float> override_y) {
++    if (!params_valid(p)) {
++        return std::unexpected(Error::degenerate_params);
++    }
++
++    const float line_length = float(p.periods) * p.wavelength;
++
++    // Direction-agnostic frame: "along" the line direction, "across" perpendicular to it
++    const float bed_along_min = p.along_y ? bed.y_min : bed.x_min;
++    const float bed_along_max = p.along_y ? bed.y_max : bed.x_max;
++    const float bed_across_min = p.along_y ? bed.x_min : bed.y_min;
++    const float bed_across_max = p.along_y ? bed.x_max : bed.y_max;
++
++    if (line_length > bed_along_max - bed_along_min || p.amplitude > bed_across_max - bed_across_min) {
++        return std::unexpected(Error::does_not_fit);
++    }
++
++    const std::optional<float> &override_along = p.along_y ? override_y : override_x;
++    const std::optional<float> &override_across = p.along_y ? override_x : override_y;
++
++    float along = override_along.value_or(bed_along_min + 5.f);
++    float across = override_across.value_or(bed_across_min + 3.5f);
++
++    if (p.adaptive && print_area) {
++        const float area_along_min = p.along_y ? print_area->y_min : print_area->x_min;
++        const float area_along_max = p.along_y ? print_area->y_max : print_area->x_max;
++        along = std::clamp(along, area_along_min - p.margin, area_along_max + p.margin);
++    }
++
++    along = std::clamp(along, bed_along_min, bed_along_max - line_length);
++    across = std::clamp(across, bed_across_min, bed_across_max - p.amplitude);
++
++    return p.along_y ? Start { .x = across, .y = along } : Start { .x = along, .y = across };
++}
++
++} // namespace squiggly_purge
+diff --git a/src/feature/squiggly_purge/squiggly_purge.hpp b/src/feature/squiggly_purge/squiggly_purge.hpp
+new file mode 100644
+index 00000000..ec008d71
+--- /dev/null
++++ b/src/feature/squiggly_purge/squiggly_purge.hpp
+@@ -0,0 +1,72 @@
++/// @file
++// ABOUTME: Pure geometry and extrusion math for the G751 squiggly purge line.
++// ABOUTME: No Marlin or hardware dependencies; unit-tested on host.
++#pragma once
++
++#include <expected>
++#include <optional>
++
++namespace squiggly_purge {
++
++inline constexpr float filament_diameter = 1.75f;
++
++struct Params {
++    float purge_length = 100.f; ///< mm of filament to purge
++    float flowrate = 10.f; ///< volumetric flow along the line, mm^3/s
++    float amplitude = 5.f; ///< squiggle peak offset, mm
++    float wavelength = 5.f; ///< length of one period along the line, mm
++    int periods = 10;
++    int steps_per_period = 16; ///< linear segments approximating one period
++    float line_height = 0.6f; ///< mm
++    float unretract = 5.f; ///< pressurizing extrusion before the line, mm
++    bool along_y = false; ///< false: line runs along X, squiggle offsets in +Y; true: swapped
++    bool adaptive = true; ///< slide the line toward the print area when known
++    float margin = 10.f; ///< distance kept from the print area in adaptive mode, mm
++    float max_cross_section = 5.f; ///< line cross-section limit, mm^2
++};
++
++enum class Error {
++    degenerate_params, ///< a parameter is zero or negative where that makes no sense
++    line_too_thin, ///< computed line is too thin to stick to the bed
++    does_not_fit, ///< the line (incl. amplitude envelope) cannot fit on the bed
++};
++
++/// Number of linear segments the line consists of
++int segment_count(const Params &p);
++
++struct PathPoint {
++    float along; ///< distance from the line start along the line direction, mm
++    float across; ///< squiggle offset perpendicular to the line, 0..amplitude, mm
++};
++
++/// Path vertex i, for i in 0..segment_count(); vertex 0 is {0, 0}
++PathPoint path_point(const Params &p, int i);
++
++/// Sum of all segment lengths, mm
++float path_length(const Params &p);
++
++struct Geometry {
++    float line_width; ///< mm
++    float feedrate; ///< mm/s
++    float purge_length; ///< mm of filament, reduced from Params if capped
++    bool capped; ///< purge_length was reduced to honor max_cross_section
++};
++
++std::expected<Geometry, Error> compute_geometry(const Params &p);
++
++struct Rect {
++    float x_min, y_min, x_max, y_max;
++};
++
++struct Start {
++    float x, y;
++};
++
++/// Absolute start position of the line.
++/// print_area: first-layer bounding box (from M555), nullopt when not known.
++/// override_x/y: caller-forced base position; adaptive sliding and bed clamping still apply.
++std::expected<Start, Error> compute_placement(const Params &p, const Rect &bed,
++    const std::optional<Rect> &print_area,
++    std::optional<float> override_x, std::optional<float> override_y);
++
++} // namespace squiggly_purge
+diff --git a/src/marlin_stubs/CMakeLists.txt b/src/marlin_stubs/CMakeLists.txt
+index 61fb0cf6..0cde6201 100644
+--- a/src/marlin_stubs/CMakeLists.txt
++++ b/src/marlin_stubs/CMakeLists.txt
+@@ -130,6 +130,10 @@ if(HAS_INDX)
+   target_sources(firmware PRIVATE G750.cpp)
+ endif()
+ 
++if(PRINTER STREQUAL "COREONE" OR PRINTER STREQUAL "COREONEL")
++  target_sources(firmware PRIVATE G751.cpp)
++endif()
++
+ if(HAS_TOOLCHANGER OR HAS_MMU2)
+   target_sources(firmware PRIVATE M9934.cpp)
+ endif()
+diff --git a/src/marlin_stubs/G751.cpp b/src/marlin_stubs/G751.cpp
+new file mode 100644
+index 00000000..2ea8305e
+--- /dev/null
++++ b/src/marlin_stubs/G751.cpp
+@@ -0,0 +1,179 @@
++/// @file
++// ABOUTME: G751 handler that draws a squiggly (cosine wave) purge line.
++// ABOUTME: Port of the Klipper community "squiggly purge" macro.
++
++#include "PrusaGcodeSuite.hpp"
++
++#include <cmath>
++#include <core/serial.h>
++#include <feature/print_area.h>
++#include <feature/squiggly_purge/squiggly_purge.hpp>
++#include <gcode/gcode_parser.hpp>
++#include <limits>
++#include <module/motion.h>
++#include <module/planner.h>
++#include <module/temperature.h>
++
++namespace {
++constexpr float travel_feedrate = 300.f; ///< mm/s
++constexpr float z_feedrate = 10.f; ///< mm/s
++constexpr float pressurize_feedrate = 5.f; ///< mm/s
++constexpr float retract_feedrate = 35.f; ///< mm/s
++constexpr float safe_z = 5.f; ///< minimum Z for the travel to the line start, mm
++constexpr float squish = 0.8f; ///< fraction of line height used as the first-touch Z
++constexpr float retract = 0.2f; ///< retraction after the line, mm
++constexpr float end_hop = 3.f; ///< Z hop after the line, mm
++constexpr float sidestep = 5.f; ///< XY move away from the finished line, mm
++
++void report_error(squiggly_purge::Error error) {
++    switch (error) {
++    case squiggly_purge::Error::degenerate_params:
++        SERIAL_ERROR_MSG("G751: invalid parameters");
++        break;
++    case squiggly_purge::Error::line_too_thin:
++        SERIAL_ERROR_MSG("G751: line too thin to stick; increase L or decrease P/W/A");
++        break;
++    case squiggly_purge::Error::does_not_fit:
++        SERIAL_ERROR_MSG("G751: line does not fit on the bed");
++        break;
++    }
++}
++} // namespace
++
++/** \addtogroup G-Codes
++ * @{
++ */
++
++/**
++ * ### G751: Squiggly purge line
++ *
++ * Draws a cosine-wave prime line and purges the given length of filament along
++ * it. Line width and feedrate are derived from the purge length and volumetric
++ * flowrate. With adaptive placement (default), the line slides along its
++ * direction toward the print area previously set by `M555`.
++ *
++ * #### Usage
++ *
++ *     G751 [ L ] [ Q ] [ A ] [ W ] [ P ] [ S ] [ H ] [ U ] [ D ] [ X ] [ Y ] [ C ] [ M ] [ B ]
++ *
++ * #### Parameters
++ *
++ * - `L` - Purge length [mm of filament] (default 100)
++ * - `Q` - Volumetric flowrate [mm^3/s] (default 10)
++ * - `A` - Squiggle amplitude [mm] (default 5)
++ * - `W` - Wavelength of one period [mm] (default 5)
++ * - `P` - Number of periods (default 10)
++ * - `S` - Line segments per period (default 16)
++ * - `H` - Line height [mm] (default 0.6)
++ * - `U` - Pressurizing extrusion before the line [mm] (default 5)
++ * - `D` - Direction: 0 = line along X, 1 = along Y (default 0)
++ * - `X`, `Y` - Start position override [mm] (default: front-left bed corner)
++ * - `C` - Adaptive placement: 1 = on, 0 = off (default 1)
++ * - `M` - Margin kept from the print area in adaptive mode [mm] (default 10)
++ * - `B` - Max line cross-section [mm^2] (default 5); purge length is reduced to fit
++ */
++void PrusaGcodeSuite::G751() {
++    GCodeParser2 p;
++    if (!p.parse_marlin_command()) {
++        return;
++    }
++
++    squiggly_purge::Params params;
++    params.purge_length = p.option<float>('L').value_or(params.purge_length);
++    params.flowrate = p.option<float>('Q').value_or(params.flowrate);
++    params.amplitude = p.option<float>('A').value_or(params.amplitude);
++    params.wavelength = p.option<float>('W').value_or(params.wavelength);
++    params.periods = p.option<int>('P').value_or(params.periods);
++    params.steps_per_period = p.option<int>('S').value_or(params.steps_per_period);
++    params.line_height = p.option<float>('H').value_or(params.line_height);
++    params.unretract = p.option<float>('U').value_or(params.unretract);
++    params.along_y = p.option<bool>('D').value_or(params.along_y);
++    params.adaptive = p.option<bool>('C').value_or(params.adaptive);
++    params.margin = p.option<float>('M').value_or(params.margin);
++    params.max_cross_section = p.option<float>('B').value_or(params.max_cross_section);
++
++    if (axes_need_homing()) {
++        SERIAL_ERROR_MSG("G751: axes not homed");
++        return;
++    }
++    if (thermalManager.tooColdToExtrude(active_extruder)) {
++        SERIAL_ERROR_MSG("G751: hotend too cold to extrude");
++        return;
++    }
++
++    const auto geometry = squiggly_purge::compute_geometry(params);
++    if (!geometry) {
++        report_error(geometry.error());
++        return;
++    }
++    if (geometry->capped) {
++        SERIAL_ECHO_MSG("G751: purge length reduced to fit the B cross-section limit");
++    }
++
++    const squiggly_purge::Rect bed_rect { X_MIN_POS, Y_MIN_POS, X_MAX_POS, Y_MAX_POS };
++
++    std::optional<squiggly_purge::Rect> print_rect;
++    const auto area = PrintArea::get_bounding_rect();
++    if (area.a.x != std::numeric_limits<float>::lowest()) { // M555 was received
++        print_rect = squiggly_purge::Rect { area.a.x, area.a.y, area.b.x, area.b.y };
++    }
++
++    const auto start = squiggly_purge::compute_placement(params, bed_rect, print_rect,
++        p.option<float>('X'), p.option<float>('Y'));
++    if (!start) {
++        report_error(start.error());
++        return;
++    }
++
++    xyze_pos_t target = current_position;
++    const auto move_to = [&target](feedRate_t feedrate) {
++        prepare_move_to(target, feedrate, {});
++    };
++
++    if (target.z < safe_z) {
++        target.z = safe_z;
++        move_to(z_feedrate);
++    }
++
++    target.x = start->x;
++    target.y = start->y;
++    move_to(travel_feedrate);
++
++    target.z = squish * params.line_height;
++    move_to(z_feedrate);
++
++    target.e += params.unretract;
++    move_to(pressurize_feedrate);
++
++    const int segments = squiggly_purge::segment_count(params);
++    const float length = squiggly_purge::path_length(params);
++    squiggly_purge::PathPoint prev = squiggly_purge::path_point(params, 0);
++    for (int i = 1; i <= segments; i++) {
++        const auto pt = squiggly_purge::path_point(params, i);
++        const float segment = std::hypot(pt.along - prev.along, pt.across - prev.across);
++        if (params.along_y) {
++            target.x = start->x + pt.across;
++            target.y = start->y + pt.along;
++        } else {
++            target.x = start->x + pt.along;
++            target.y = start->y + pt.across;
++        }
++        target.e += segment / length * geometry->purge_length;
++        move_to(geometry->feedrate);
++        prev = pt;
++    }
++
++    target.e -= retract;
++    move_to(retract_feedrate);
++
++    target.z += end_hop;
++    move_to(z_feedrate);
++
++    target.x += sidestep;
++    target.y += sidestep;
++    move_to(travel_feedrate);
++
++    planner.synchronize();
++}
++
++/** @}*/
+diff --git a/src/marlin_stubs/PrusaGcodeSuite.hpp b/src/marlin_stubs/PrusaGcodeSuite.hpp
+index 2e7f3ca5..6a787dc7 100644
+--- a/src/marlin_stubs/PrusaGcodeSuite.hpp
++++ b/src/marlin_stubs/PrusaGcodeSuite.hpp
+@@ -100,6 +100,10 @@ void G427(); ///< Tool offset calibration (Z-probe + XY tool offset board calib)
+ void G750(); ///< Move to absolute X,Y position with nozzle cleaner origin offset
+ #endif
+ 
++#if (PRINTER_IS_PRUSA_COREONE() || PRINTER_IS_PRUSA_COREONEL()) && !HAS_INDX()
++void G751(); ///< Draw a squiggly purge (prime) line
++#endif
++
+ #ifdef PRINT_CHECKING_Q_CMDS
+ /// @name Print checking commands
+ ///
+diff --git a/src/marlin_stubs/gcode.cpp b/src/marlin_stubs/gcode.cpp
+index 2a4228dc..7a5ef1b2 100644
+--- a/src/marlin_stubs/gcode.cpp
++++ b/src/marlin_stubs/gcode.cpp
+@@ -415,6 +415,11 @@ bool GcodeSuite::process_parsed_command_custom(bool no_ok) {
+         case 750:
+             PrusaGcodeSuite::G750();
+             break;
++#endif
++#if (PRINTER_IS_PRUSA_COREONE() || PRINTER_IS_PRUSA_COREONEL()) && !HAS_INDX()
++        case 751:
++            PrusaGcodeSuite::G751();
++            break;
+ #endif
+         default:
+             processed = false;
+diff --git a/tests/unit/feature/CMakeLists.txt b/tests/unit/feature/CMakeLists.txt
+index e415ed85..5b01ba47 100644
+--- a/tests/unit/feature/CMakeLists.txt
++++ b/tests/unit/feature/CMakeLists.txt
+@@ -6,3 +6,4 @@ add_subdirectory(ramming)
+ add_subdirectory(cork)
+ add_subdirectory(gcode_exception)
+ add_subdirectory(tool_index)
++add_subdirectory(squiggly_purge)
+diff --git a/tests/unit/feature/squiggly_purge/CMakeLists.txt b/tests/unit/feature/squiggly_purge/CMakeLists.txt
+new file mode 100644
+index 00000000..658ec629
+--- /dev/null
++++ b/tests/unit/feature/squiggly_purge/CMakeLists.txt
+@@ -0,0 +1,7 @@
++add_compile_definitions(UNITTEST)
++add_executable(
++  squiggly_purge_tests ${CMAKE_CURRENT_SOURCE_DIR}/squiggly_purge_tests.cpp
++                       ${CMAKE_SOURCE_DIR}/src/feature/squiggly_purge/squiggly_purge.cpp
++  )
++target_include_directories(squiggly_purge_tests PUBLIC ${CMAKE_SOURCE_DIR}/src)
++add_catch_test(squiggly_purge_tests)
+diff --git a/tests/unit/feature/squiggly_purge/squiggly_purge_tests.cpp b/tests/unit/feature/squiggly_purge/squiggly_purge_tests.cpp
+new file mode 100644
+index 00000000..5878fa6e
+--- /dev/null
++++ b/tests/unit/feature/squiggly_purge/squiggly_purge_tests.cpp
+@@ -0,0 +1,220 @@
++/// @file
++// ABOUTME: Host unit tests for the squiggly purge pure geometry module.
++// ABOUTME: Reference values are analytic (default params, 1.75 mm filament).
++#include <feature/squiggly_purge/squiggly_purge.hpp>
++
++#include <catch2/catch_approx.hpp>
++#include <catch2/catch_test_macros.hpp>
++#include <cmath>
++
++using Catch::Approx;
++using namespace squiggly_purge;
++
++TEST_CASE("squiggly_purge: path generation") {
++    Params p;
++
++    SECTION("segment count is periods x steps") {
++        REQUIRE(segment_count(p) == 160);
++    }
++
++    SECTION("path starts at origin of the line frame") {
++        REQUIRE(path_point(p, 0).along == Approx(0.f));
++        REQUIRE(path_point(p, 0).across == Approx(0.f));
++    }
++
++    SECTION("crest of the first period reaches the amplitude") {
++        // half a period in: cos(pi) = -1 -> across = amplitude
++        const auto crest = path_point(p, p.steps_per_period / 2);
++        REQUIRE(crest.along == Approx(p.wavelength / 2));
++        REQUIRE(crest.across == Approx(p.amplitude));
++    }
++
++    SECTION("period boundary returns to zero offset") {
++        const auto trough = path_point(p, p.steps_per_period);
++        REQUIRE(trough.along == Approx(p.wavelength));
++        REQUIRE(trough.across == Approx(0.f).margin(1e-5));
++    }
++
++    SECTION("path length matches the analytic reference") {
++        REQUIRE(path_length(p) == Approx(114.6837f).epsilon(0.001));
++    }
++
++    SECTION("path length exceeds the straight-line length") {
++        REQUIRE(path_length(p) > float(p.periods) * p.wavelength);
++    }
++}
++
++TEST_CASE("squiggly_purge: extrusion geometry") {
++    Params p;
++
++    SECTION("default parameters match the analytic reference") {
++        const auto g = compute_geometry(p);
++        REQUIRE(g.has_value());
++        REQUIRE(g->line_width == Approx(3.49553f).epsilon(0.001));
++        REQUIRE(g->feedrate == Approx(4.76799f).epsilon(0.001));
++        REQUIRE(g->purge_length == Approx(100.f));
++        REQUIRE_FALSE(g->capped);
++    }
++
++    SECTION("cross-section limit shortens the purge") {
++        p.max_cross_section = 1.5f;
++        const auto g = compute_geometry(p);
++        REQUIRE(g.has_value());
++        REQUIRE(g->capped);
++        // 0.98 * B * path_length / filament_area
++        REQUIRE(g->purge_length == Approx(70.0895f).epsilon(0.001));
++        // capped width = 0.98 * B / H
++        REQUIRE(g->line_width == Approx(2.45f).epsilon(0.001));
++    }
++
++    SECTION("Klipper's default cross-section cap makes the default line too thin") {
++        // documents why B defaults to 5 (KAMP) instead of Klipper's 4*nozzle_d^2
++        p.max_cross_section = 0.64f;
++        const auto g = compute_geometry(p);
++        REQUIRE_FALSE(g.has_value());
++        REQUIRE(g.error() == Error::line_too_thin);
++    }
++
++    SECTION("short purge on a long path is too thin to stick") {
++        p.purge_length = 20.f;
++        const auto g = compute_geometry(p);
++        REQUIRE_FALSE(g.has_value());
++        REQUIRE(g.error() == Error::line_too_thin);
++    }
++
++    SECTION("degenerate parameters are rejected") {
++        SECTION("zero periods") { p.periods = 0; }
++        SECTION("zero steps") { p.steps_per_period = 0; }
++        SECTION("zero wavelength") { p.wavelength = 0; }
++        SECTION("zero line height") { p.line_height = 0; }
++        SECTION("zero purge length") { p.purge_length = 0; }
++        SECTION("zero flowrate") { p.flowrate = 0; }
++        SECTION("zero cross-section limit") { p.max_cross_section = 0; }
++        SECTION("negative amplitude") { p.amplitude = -1; }
++        SECTION("negative margin") { p.margin = -1; }
++        const auto g = compute_geometry(p);
++        REQUIRE_FALSE(g.has_value());
++        REQUIRE(g.error() == Error::degenerate_params);
++    }
++}
++
++TEST_CASE("squiggly_purge: placement") {
++    Params p;
++    const Rect bed { 0, 0, 250, 220 }; // CoreOne-like
++
++    SECTION("defaults to the front-left corner") {
++        const auto s = compute_placement(p, bed, std::nullopt, std::nullopt, std::nullopt);
++        REQUIRE(s.has_value());
++        REQUIRE(s->x == Approx(5.f));
++        REQUIRE(s->y == Approx(3.5f));
++    }
++
++    SECTION("Y-direction line swaps the frame") {
++        p.along_y = true;
++        const auto s = compute_placement(p, bed, std::nullopt, std::nullopt, std::nullopt);
++        REQUIRE(s.has_value());
++        REQUIRE(s->x == Approx(3.5f));
++        REQUIRE(s->y == Approx(5.f));
++    }
++
++    SECTION("adaptive slides the line toward the print area") {
++        const Rect area { 150, 80, 200, 120 };
++        const auto s = compute_placement(p, bed, area, std::nullopt, std::nullopt);
++        REQUIRE(s.has_value());
++        REQUIRE(s->x == Approx(140.f)); // clamped into [150-10, 200+10]
++        REQUIRE(s->y == Approx(3.5f)); // cross coordinate untouched
++    }
++
++    SECTION("adaptive near the far bed edge is pulled back onto the bed") {
++        const Rect area { 230, 100, 248, 120 };
++        const auto s = compute_placement(p, bed, area, std::nullopt, std::nullopt);
++        REQUIRE(s.has_value());
++        // adaptive wants 220; envelope clamp allows at most 250 - 50 = 200
++        REQUIRE(s->x == Approx(200.f));
++    }
++
++    SECTION("print area already near the default keeps the default") {
++        const Rect area { 10, 10, 60, 60 };
++        const auto s = compute_placement(p, bed, area, std::nullopt, std::nullopt);
++        REQUIRE(s.has_value());
++        REQUIRE(s->x == Approx(5.f)); // already within [0, 70]
++    }
++
++    SECTION("adaptive off ignores the print area") {
++        p.adaptive = false;
++        const Rect area { 150, 80, 200, 120 };
++        const auto s = compute_placement(p, bed, area, std::nullopt, std::nullopt);
++        REQUIRE(s.has_value());
++        REQUIRE(s->x == Approx(5.f));
++    }
++
++    SECTION("cross-coordinate override is clamped to keep the amplitude on the bed") {
++        const auto s = compute_placement(p, bed, std::nullopt, std::nullopt, 218.f);
++        REQUIRE(s.has_value());
++        REQUIRE(s->y == Approx(215.f)); // 220 - amplitude
++    }
++
++    SECTION("line longer than the bed does not fit") {
++        const Rect narrow_bed { 0, 0, 40, 220 };
++        const auto s = compute_placement(p, narrow_bed, std::nullopt, std::nullopt, std::nullopt);
++        REQUIRE_FALSE(s.has_value());
++        REQUIRE(s.error() == Error::does_not_fit);
++    }
++
++    SECTION("amplitude taller than the bed does not fit") {
++        p.amplitude = 300.f;
++        const auto s = compute_placement(p, bed, std::nullopt, std::nullopt, std::nullopt);
++        REQUIRE_FALSE(s.has_value());
++        REQUIRE(s.error() == Error::does_not_fit);
++    }
++}
++
++// Integration: the full parameter -> move-plan pipeline over a tiny line whose
++// numbers are exactly computable by hand. 2 periods x 2 steps of a 5 mm
++// wavelength: 4 equal segments of hypot(2.5, 5) = 5.59017 mm, path 22.36068 mm.
++// The natural width (17.93 mm) exceeds B=5, so the purge is capped:
++// purge = 0.98 * 5 * 22.36068 / 2.405282 = 45.5508 mm, width = 0.98*5/0.6 = 8.16667 mm.
++TEST_CASE("squiggly_purge: full move plan for a tiny line") {
++    Params p;
++    p.periods = 2;
++    p.steps_per_period = 2;
++    const Rect bed { 0, 0, 250, 220 };
++
++    const auto geometry = compute_geometry(p);
++    REQUIRE(geometry.has_value());
++    REQUIRE(geometry->capped);
++    REQUIRE(geometry->purge_length == Approx(45.5508f).epsilon(0.001));
++    REQUIRE(geometry->line_width == Approx(8.16667f).epsilon(0.001));
++    REQUIRE(geometry->feedrate == Approx(2.04082f).epsilon(0.001));
++
++    const auto start = compute_placement(p, bed, std::nullopt, std::nullopt, std::nullopt);
++    REQUIRE(start.has_value());
++
++    // Assemble absolute vertices and cumulative extrusion the way the handler does
++    const float length = path_length(p);
++    struct Move {
++        float x, y, e;
++    };
++    Move moves[4];
++    float e = 0;
++    PathPoint prev = path_point(p, 0);
++    for (int i = 1; i <= segment_count(p); i++) {
++        const PathPoint pt = path_point(p, i);
++        e += std::hypot(pt.along - prev.along, pt.across - prev.across) / length * geometry->purge_length;
++        moves[i - 1] = { start->x + pt.along, start->y + pt.across, e };
++        prev = pt;
++    }
++
++    const Move expected[4] = {
++        { 7.5f, 8.5f, 11.3877f },
++        { 10.0f, 3.5f, 22.7754f },
++        { 12.5f, 8.5f, 34.1631f },
++        { 15.0f, 3.5f, 45.5508f },
++    };
++    for (int i = 0; i < 4; i++) {
++        CAPTURE(i);
++        REQUIRE(moves[i].x == Approx(expected[i].x).epsilon(0.001));
++        REQUIRE(moves[i].y == Approx(expected[i].y).margin(0.01));
++        REQUIRE(moves[i].e == Approx(expected[i].e).epsilon(0.001));
++    }
++}

@@ -29,8 +29,9 @@ and a version.txt without +N keeps stock git-count behavior). Pick N above
 the installed firmware's build number so the bootloader auto-offers the
 .bbf.
 
-Validate (host unit tests, needs GCC -- see macos-host-unit-tests.patch on
-macOS):
+Validate (host unit tests, needs GCC; build first, then run -- the -t
+flag skips building):
+    python3 utils/build_tests.py memory_byte_reader_tests
     python3 utils/build_tests.py memory_byte_reader_tests -t -- -R MemoryByteReader
 
 Prepared against release 6.6.2. If a future release rejects hunks, the new

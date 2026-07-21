@@ -47,12 +47,11 @@ the built `.bbf`.
 
 ## Validation
 
-Build the CoreOne firmware as usual, and run the host unit test:
+Build the CoreOne firmware as usual, and run the host unit test — build
+the test target first, then run it (the `-t` flag skips building):
 
+    python3 utils/build_tests.py memory_byte_reader_tests
     python3 utils/build_tests.py memory_byte_reader_tests -t -- -R MemoryByteReader
-
-(On macOS the host tests additionally need `patches/macos-host-unit-tests.patch`
-and a GNU GCC, e.g. Homebrew gcc.)
 
 ## Notes
 
